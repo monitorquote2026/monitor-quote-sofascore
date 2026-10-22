@@ -1,33 +1,100 @@
-import csv, json, os, pathlib, datetime, html
-ROOT=pathlib.Path(__file__).parent
-DATA=ROOT/'data'; DATA.mkdir(exist_ok=True)
-HISTORY=DATA/'events.json'; INPUT=DATA/'authorized_feed.csv'
-now=datetime.datetime.now(datetime.timezone.utc)
-rows=json.loads(HISTORY.read_text(encoding='utf8')) if HISTORY.exists() else {}
-# The feed must be populated only from a licensed/authorized source.
-if INPUT.exists():
-    with INPUT.open(newline='',encoding='utf-8-sig') as f:
-        for r in csv.DictReader(f):
-            key=(r.get('event_id') or '').strip()
-            if not key: continue
-            try: initial=float(r['initial_odds']); current=float(r['current_odds'])
-            except (ValueError,KeyError): continue
-            if initial<=0 or current<=0: continue
-            drop=round((initial-current)/initial*100,2)
-            start=(r.get('start_utc') or '').strip()
-            try: kickoff=datetime.datetime.fromisoformat(start.replace('Z','+00:00'))
-            except ValueError: continue
-            if kickoff.tzinfo is None: kickoff=kickoff.replace(tzinfo=datetime.timezone.utc)
-            cutoff=kickoff-datetime.timedelta(minutes=5)
-            item=rows.setdefault(key, {'event_id':key,'sport':r.get('sport',''), 'event':r.get('event',''), 'start_utc':start,'initial_odds':initial,'max_drop':0,'observations':[],'final_score':''})
-            if now<=cutoff:
-                item['observations'].append({'at_utc':now.isoformat(),'odds':current,'drop_pct':drop})
-                item['max_drop']=max(item['max_drop'],drop)
-            if (r.get('status') or '').lower() in ('finished','final'):
-                item['final_score']=r.get('final_score','')
-HISTORY.write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf8')
-shown=sorted((v for v in rows.values() if v['max_drop']>=30),key=lambda v:v['start_utc'],reverse=True)
-trs=''.join('<tr>'+''.join('<td>'+html.escape(str(x))+'</td>' for x in [v['sport'],v['event'],v['start_utc'],v['initial_odds'],str(v['max_drop'])+'%',v['final_score'] or 'In attesa'])+'</tr>' for v in shown)
-page='''<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Monitor quote</title><style>body{font:16px system-ui;background:#111827;color:#f9fafb;margin:2rem}table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #374151;text-align:left;padding:.7rem}th{color:#93c5fd}.note{color:#d1d5db}</style><h1>Monitor quote · cali ≥30%</h1><p class="note">Fonte autorizzata necessaria. Nessun dato SofaScore viene estratto da questa versione.</p><div style="overflow:auto"><table><thead><tr><th>Sport</th><th>Evento</th><th>Inizio UTC</th><th>Quota iniziale</th><th>Max calo</th><th>Risultato</th></tr></thead><tbody>'''+trs+'''</tbody></table></div><p class="note">Ultimo aggiornamento: '''+now.isoformat()+'''</p></html>'''
-(ROOT/'index.html').write_text(page,encoding='utf8')
-print(f'Eventi in archivio: {len(rows)}, mostrati: {len(shown)}')
+import csv
+import datetime as dt
+import html
+import json
+import os
+import pathlib
+import urllib.parse
+import urllib.request
+
+ROOT = pathlib.Path(__file__).resolve().parent
+DATA = ROOT / 'data'
+DATA.mkdir(exist_ok=True)
+HISTORY = DATA / 'events.json'
+KEY = os.getenv('ODDS_API_KEY', '').strip()
+SPORT = os.getenv('ODDS_SPORT', 'soccer_italy_serie_a')
+REGIONS = os.getenv('ODDS_REGIONS', 'eu')
+MARKETS = 'h2h'
+
+
+def utcnow():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def fetch(path, params):
+    url = 'https://api.the-odds-api.com/v4/' + path + '?' + urllib.parse.urlencode(params)
+    request = urllib.request.Request(url, headers={'User-Agent': 'PersonalOddsMonitor/1.0'})
+    with urllib.request.urlopen(request, timeout=25) as response:
+        body = json.load(response)
+        remaining = response.headers.get('x-requests-remaining', 'unknown')
+        used = response.headers.get('x-requests-used', 'unknown')
+        print(f'API credits: used={used}; remaining={remaining}')
+        return body
+
+
+def load():
+    if HISTORY.exists():
+        try:
+            obj = json.loads(HISTORY.read_text(encoding='utf-8'))
+            return obj if isinstance(obj, dict) else {}
+        except (ValueError, OSError):
+            pass
+    return {}
+
+
+def main():
+    events = load()
+    now = utcnow()
+    if KEY:
+        try:
+            games = fetch(f'sports/{urllib.parse.quote(SPORT, safe="")}/odds/', {
+                'apiKey': KEY, 'regions': REGIONS, 'markets': MARKETS, 'oddsFormat': 'decimal'
+            })
+            for game in games:
+                start = dt.datetime.fromisoformat(game['commence_time'].replace('Z', '+00:00'))
+                if now > start - dt.timedelta(minutes=5):
+                    continue
+                for book in game.get('bookmakers', []):
+                    for market in book.get('markets', []):
+                        if market.get('key') != 'h2h':
+                            continue
+                        for outcome in market.get('outcomes', []):
+                            price = outcome.get('price')
+                            if not isinstance(price, (int, float)) or price <= 1:
+                                continue
+                            event_id = '|'.join([game['id'], book['key'], outcome['name']])
+                            record = events.setdefault(event_id, {
+                                'event_id': game['id'], 'sport': SPORT,
+                                'event': f"{game.get('home_team', '')} - {game.get('away_team', '')}",
+                                'bookmaker': book['title'], 'selection': outcome['name'],
+                                'start_utc': game['commence_time'], 'initial_odds': price,
+                                'min_odds': price, 'max_drop': 0, 'observations': [],
+                                'status': 'scheduled', 'final_score': ''
+                            })
+                            record['min_odds'] = min(record['min_odds'], price)
+                            drop = round((record['initial_odds'] - price) / record['initial_odds'] * 100, 2)
+                            record['max_drop'] = max(record['max_drop'], drop)
+                            record['observations'].append({'at': now.isoformat(), 'odds': price, 'drop': drop})
+            print(f'Fetched {len(games)} games; tracked {len(events)} bookmaker selections')
+        except Exception as exc:
+            print(f'API fetch failed: {type(exc).__name__}: {exc}')
+            raise
+    else:
+        print('ODDS_API_KEY missing: no API request made')
+
+    HISTORY.write_text(json.dumps(events, ensure_ascii=False, indent=2), encoding='utf-8')
+    matches = sorted((e for e in events.values() if e.get('max_drop', 0) >= 30),
+                     key=lambda e: e.get('start_utc', ''), reverse=True)
+    rows = []
+    for e in matches[:500]:
+        cells = [e.get('sport', ''), e.get('event', ''), e.get('bookmaker', ''),
+                 e.get('selection', ''), e.get('initial_odds', ''), e.get('min_odds', ''),
+                 f"{e.get('max_drop', 0):.2f}%", e.get('start_utc', ''),
+                 e.get('final_score', '')]
+        rows.append('<tr>' + ''.join('<td>' + html.escape(str(v)) + '</td>' for v in cells) + '</tr>')
+    doc = '''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Monitor Quote</title><style>body{font:16px system-ui,sans-serif;margin:30px;background:#f8fafc;color:#111827}table{border-collapse:collapse;width:100%;background:white}th,td{padding:10px;border:1px solid #e5e7eb;text-align:left}th{background:#e2e8f0}.wrap{overflow-x:auto}</style></head><body><h1>Monitor Quote</h1><p>Quote con calo rilevato almeno del 30%. Fonte: The Odds API. Quote iniziale = prima osservazione registrata, non necessariamente quota di apertura.</p><p>Ultimo aggiornamento: ''' + html.escape(now.isoformat()) + ''' UTC · Selezioni monitorate: ''' + str(len(events)) + ''' · Calo ≥30%: ''' + str(len(matches)) + '''</p><div class="wrap"><table><thead><tr><th>Sport</th><th>Evento</th><th>Bookmaker</th><th>Esito</th><th>Prima quota</th><th>Minima</th><th>Max calo</th><th>Inizio (UTC)</th><th>Risultato</th></tr></thead><tbody>''' + ''.join(rows) + '''</tbody></table></div><p>Risultati finali non ancora integrati. Aggiornamenti programmati soggetti ai limiti di GitHub Actions e dei crediti API.</p></body></html>'''
+    (ROOT / 'index.html').write_text(doc, encoding='utf-8')
+
+
+if __name__ == '__main__':
+    main()
