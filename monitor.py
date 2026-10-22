@@ -82,18 +82,127 @@ def main():
     else:
         print('ODDS_API_KEY missing: no API request made')
 
+    # Manteniamo lo storico completo; la dashboard visualizza solo i cali.
     HISTORY.write_text(json.dumps(events, ensure_ascii=False, indent=2), encoding='utf-8')
-    matches = sorted((e for e in events.values() if e.get('max_drop', 0) >= 30),
-                     key=lambda e: e.get('start_utc', ''), reverse=True)
-    rows = []
-    for e in matches[:500]:
-        cells = [e.get('sport', ''), e.get('event', ''), e.get('bookmaker', ''),
-                 e.get('selection', ''), e.get('initial_odds', ''), e.get('min_odds', ''),
-                 f"{e.get('max_drop', 0):.2f}%", e.get('start_utc', ''),
-                 e.get('final_score', '')]
-        rows.append('<tr>' + ''.join('<td>' + html.escape(str(v)) + '</td>' for v in cells) + '</tr>')
-    doc = '''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Monitor Quote</title><style>body{font:16px system-ui,sans-serif;margin:30px;background:#f8fafc;color:#111827}table{border-collapse:collapse;width:100%;background:white}th,td{padding:10px;border:1px solid #e5e7eb;text-align:left}th{background:#e2e8f0}.wrap{overflow-x:auto}</style></head><body><h1>Monitor Quote</h1><p>Quote con calo rilevato almeno del 30%. Fonte: The Odds API. Quote iniziale = prima osservazione registrata, non necessariamente quota di apertura.</p><p>Ultimo aggiornamento: ''' + html.escape(now.isoformat()) + ''' UTC · Selezioni monitorate: ''' + str(len(events)) + ''' · Calo ≥30%: ''' + str(len(matches)) + '''</p><div class="wrap"><table><thead><tr><th>Sport</th><th>Evento</th><th>Bookmaker</th><th>Esito</th><th>Prima quota</th><th>Minima</th><th>Max calo</th><th>Inizio (UTC)</th><th>Risultato</th></tr></thead><tbody>''' + ''.join(rows) + '''</tbody></table></div><p>Risultati finali non ancora integrati. Aggiornamenti programmati soggetti ai limiti di GitHub Actions e dei crediti API.</p></body></html>'''
-    (ROOT / 'index.html').write_text(doc, encoding='utf-8')
+
+    selections = []
+    for e in events.values():
+        observations = e.get('observations') or []
+        if not observations:
+            continue
+        first = e.get('initial_odds')
+        latest = observations[-1].get('odds')
+        if not isinstance(first, (int, float)) or first <= 0:
+            continue
+        if not isinstance(latest, (int, float)) or latest <= 0:
+            continue
+        current_drop = round((first - latest) / first * 100, 2)
+        if current_drop <= 0:
+            continue
+        item = {
+            'sport': e.get('sport', ''),
+            'event': e.get('event', ''),
+            'bookmaker': e.get('bookmaker', ''),
+            'selection': e.get('selection', ''),
+            'initial': first,
+            'current': latest,
+            'drop': current_drop,
+            'max_drop': e.get('max_drop', 0),
+            'last_seen': observations[-1].get('at', ''),
+            'start': e.get('start_utc', ''),
+        }
+        selections.append(item)
+
+    selections.sort(key=lambda item: item['drop'], reverse=True)
+    # Inseriamo i dati JSON in modo sicuro, evitando l'iniezione di tag HTML.
+    payload = json.dumps(selections, ensure_ascii=False).replace('<', r'\\u003c')
+    summary = {
+        'tracked': len(events),
+        'descending': len(selections),
+        'significant': sum(e['drop'] >= 30 for e in selections),
+        'updated': now.isoformat(),
+    }
+    summary_json = json.dumps(summary, ensure_ascii=False).replace('<', r'\\u003c')
+
+    page = r"""<!doctype html>
+<html lang="it"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Monitor Quote | Quote in discesa</title>
+<style>
+:root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#172033;background:#f4f7fb}
+*{box-sizing:border-box}body{margin:0}.container{max-width:1250px;margin:auto;padding:26px 18px 60px}
+h1{margin:0 0 6px;font-size:clamp(25px,4vw,36px)}h2{font-size:20px;margin:0}
+.muted{color:#64748b}.sub{margin:0 0 24px}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:20px 0}
+.card,.panel{background:white;border:1px solid #e1e7ef;border-radius:14px;padding:18px}
+.card .num{font-size:29px;font-weight:750;margin-top:6px}.toolbar{display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin:18px 0}
+label{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:650}
+select,input{border:1px solid #cbd5e1;border-radius:8px;padding:10px;font:inherit;background:white;min-width:145px}
+input{min-width:210px}button{border:0;border-radius:8px;padding:11px 14px;background:#1e40af;color:white;cursor:pointer}
+table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;padding:12px 10px;border-bottom:1px solid #edf1f6}
+th{color:#475569;font-size:12px;background:#f8fafc;white-space:nowrap}
+.scroll{overflow-x:auto}.drop{font-weight:750;color:#b45309}.big{color:#b91c1c}
+.small{font-size:12px}.empty{padding:32px;text-align:center;color:#64748b}
+footer{margin-top:18px;font-size:13px;color:#64748b}
+@media(max-width:650px){.cards{grid-template-columns:1fr}.card{padding:13px}.container{padding:16px 10px}}
+</style></head><body><main class="container">
+<h1>📉 Monitor Quote</h1>
+<p class="sub muted">Solo quote attualmente in discesa · Fonte: The Odds API · Prima quota = prima rilevazione, non quota di apertura.</p>
+<section class="cards">
+<div class="card"><div class="muted">Selezioni monitorate</div><div class="num" id="tracked">—</div></div>
+<div class="card"><div class="muted">Quote attualmente in discesa</div><div class="num" id="descending">—</div></div>
+<div class="card"><div class="muted">Cali attuali ≥30%</div><div class="num" id="significant">—</div></div>
+</section>
+<section class="panel">
+<h2>Quote in discesa</h2>
+<div class="toolbar">
+<label>Calo minimo
+<select id="threshold"><option value="1">1%</option><option value="5" selected>5%</option><option value="10">10%</option><option value="30">30%</option></select></label>
+<label>Bookmaker<select id="bookmaker"><option value="">Tutti</option></select></label>
+<label>Cerca partita o esito<input id="search" placeholder="Es. Inter, Napoli..."></label>
+<button id="reset" type="button">Azzera filtri</button>
+</div>
+<p class="muted small" id="count"></p>
+<div class="scroll"><table><thead><tr><th>Evento / sport</th><th>Esito</th><th>Bookmaker</th><th>Prima quota → attuale</th><th>Calo attuale</th><th>Calo massimo</th><th>Ultima rilevazione (UTC)</th></tr></thead>
+<tbody id="rows"></tbody></table></div>
+<p class="empty" id="empty" hidden>Nessuna quota in discesa corrisponde ai filtri selezionati.</p>
+</section>
+<footer><span id="updated"></span><p>Il calo attuale è calcolato rispetto alla prima quota osservata presso lo stesso bookmaker. Il calo massimo è storico e può non essere più disponibile. Gli eventi passati restano nello storico; non sono necessariamente quote giocabili. I risultati finali non sono ancora integrati. Gli aggiornamenti dipendono da GitHub Actions e dai crediti API.</p></footer>
+</main>
+<script id="odds-data" type="application/json">__ODDS_JSON__</script>
+<script id="summary-data" type="application/json">__SUMMARY_JSON__</script>
+<script>
+const odds=JSON.parse(document.getElementById('odds-data').textContent);
+const summary=JSON.parse(document.getElementById('summary-data').textContent);
+const $=id=>document.getElementById(id);
+$('tracked').textContent=summary.tracked.toLocaleString('it-IT');
+$('descending').textContent=summary.descending.toLocaleString('it-IT');
+$('significant').textContent=summary.significant.toLocaleString('it-IT');
+$('updated').textContent='Ultimo aggiornamento: '+summary.updated+' (UTC)';
+const bookmakers=[...new Set(odds.map(x=>x.bookmaker))].sort();
+for(const b of bookmakers){const o=document.createElement('option');o.value=b;o.textContent=b;$('bookmaker').append(o)}
+function cell(tr,text,className){const td=document.createElement('td');td.textContent=text;if(className)td.className=className;tr.append(td)}
+function render(){
+ const min=Number($('threshold').value),book=$('bookmaker').value,q=$('search').value.trim().toLowerCase();
+ const selected=odds.filter(x=>x.drop>=min&&(!book||x.bookmaker===book)&&(!q||(x.event+' '+x.selection+' '+x.sport).toLowerCase().includes(q)));
+ const body=$('rows');body.replaceChildren();
+ for(const x of selected.slice(0,500)){
+   const tr=document.createElement('tr');
+   cell(tr,x.event+' · '+x.sport);cell(tr,x.selection);cell(tr,x.bookmaker);
+   cell(tr,x.initial.toFixed(2)+' → '+x.current.toFixed(2));
+   cell(tr,'−'+x.drop.toFixed(2)+'%',x.drop>=30?'drop big':'drop');
+   cell(tr,'−'+Number(x.max_drop).toFixed(2)+'%');
+   cell(tr,x.last_seen);
+   body.append(tr);
+ }
+ $('count').textContent=selected.length+' selezioni trovate'+(selected.length>500?' (prime 500 visualizzate)':'');
+ $('empty').hidden=selected.length!==0;
+}
+for(const id of ['threshold','bookmaker','search'])$(id).addEventListener(id==='search'?'input':'change',render);
+$('reset').addEventListener('click',()=>{$('threshold').value='5';$('bookmaker').value='';$('search').value='';render()});
+render();
+</script></body></html>"""
+    page = page.replace('__ODDS_JSON__', payload).replace('__SUMMARY_JSON__', summary_json)
+    (ROOT / 'index.html').write_text(page, encoding='utf-8')
 
 
 if __name__ == '__main__':
